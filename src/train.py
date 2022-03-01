@@ -1,6 +1,6 @@
 from sklearn.metrics import precision_recall_fscore_support, matthews_corrcoef
 import torch
-from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoModel, AutoTokenizer #, get_linear_schedule_with_warmup
 from data import get_examples, TransformersData
 from torch.utils.data import DataLoader
 import numpy as np
@@ -9,8 +9,9 @@ import random
 from tqdm import tqdm
 import json
 import sys
+import os
 # import pandas as pd
-
+    
 # INPUTS
 pretrained_transformers_model = sys.argv[1] # For example: "xlm-roberta-base"
 seed = int(sys.argv[2])
@@ -18,15 +19,33 @@ max_seq_length = int(sys.argv[3]) # max length of a document (in tokens)
 batch_size = int(sys.argv[4])
 dev_ratio = float(sys.argv[5])
 
+# repo path is needed to find the relevant files.
+repo_path = os.path.abspath('./')
+print('repo_path:', repo_path)
+if repo_path.split('/')[-1] != 'transformers_text_classification':
+    print('The absolute path to the repo is not correct. Double check! Exit ...')
+    sys.exit()
+
 # MUST SET THESE VALUES
-repo_path = "/path/to/this/repo"
-train_filename = repo_path + "/data/train_examples.json" # sys.argv[1]
-test_filename = repo_path + "/data/test_examples.json"
-# test_filename = repo_path + "/data/examples_to_be_predicted.json"
-label_list = ["category1", "category2", "category3"]
-only_test = False # Only perform testing
-predict = False # Predict instead of testing
-has_token_type_ids = False
+train_filename = repo_path + "/data/odeuropa_benchmark_en_bio_shuffled_train_20220219.jsonl" # sys.argv[1]
+test_filename = repo_path + "/data/odeuropa_benchmark_en_bio_shuffled_test_20220219.jsonl" # training time test
+label_list = ["0", "1"]
+
+mode_selection = 'predictfile'
+if mode_selection == 'training': # proper training
+    only_test, predict = False, False
+elif mode_selection == 'testonly': # the test set will be processed and scores will be reported.
+    only_test, predict = True, False
+elif mode_selection == 'predictfile': # predict a new file and write predictions in the file
+    only_test, predict = True, True
+    test_filename = repo_path + "/data/predictions_bert-emotions.csv.jsonl"  # "/data/fairy_sentences.jsonl" # text to predict.
+else:
+    print('please set a mode: training, testonly, predictfile. Exit ...')
+    sys.exit()
+print('The mode is', mode_selection)
+print('The file to be predicted is', test_filename)
+    
+has_token_type_ids = False # maybe old type BERT. calisiyorsa dokunma.
 
 # SETTINGS
 learning_rate = 2e-5
@@ -38,23 +57,23 @@ device_ids = [0, 1, 2, 3, 4, 5, 6, 7]
 
 
 if use_gpu and torch.cuda.is_available():
+    print('using GPU!')
     device = torch.device("cuda:%d"%(device_ids[0]))
 else:
+    print('using CPU!')
     device = torch.device("cpu")
 
 np.random.seed(seed)
 torch.manual_seed(seed)
+random.seed(seed)
 if device.type == "cuda":
     torch.cuda.manual_seed_all(seed)
 
-label_to_idx = {}
-idx_to_label = {}
-for (i, label) in enumerate(label_list):
-    label_to_idx[label] = i
-    idx_to_label[i] = label
-
 tokenizer = None
 model_path = "{}_{}_{}_{:.2f}_{}.pt".format(pretrained_transformers_model.replace("/", "_"), max_seq_length, batch_size, dev_ratio, seed)
+
+perf_scores_path = model_path[:-3]+'.txt'
+
 criterion = torch.nn.BCEWithLogitsLoss() if len(label_list) == 2 else torch.nn.CrossEntropyLoss(ignore_index=-1)
 
 def test_model(encoder, classifier, dataloader):
@@ -72,7 +91,7 @@ def test_model(encoder, classifier, dataloader):
 
         with torch.no_grad():
             out = classifier(embeddings)
-            tmp_eval_loss = criterion(out, label_ids)
+            tmp_eval_loss = criterion(out.view(-1), label_ids.view(-1))
 
         eval_loss += tmp_eval_loss.mean().item()
 
@@ -110,16 +129,16 @@ def model_predict(encoder, classifier, dataloader):
             input_ids, input_mask = tuple(t.to(device) for t in batch)
             embeddings = encoder(input_ids, attention_mask=input_mask)[1]
 
-        with torch.no_grad():
+        with torch.no_grad(): # gerek olmayabilir, cunku eval mode enabled. ne olur ne olmaz.
             out = classifier(embeddings)
 
         if len(label_list) == 2:
             curr_preds = torch.sigmoid(out).detach().cpu().numpy().flatten()
-            curr_preds = [idx_to_label[int(x >= 0.5)] for x in curr_preds]
+            curr_preds = [int(x >= 0.5) for x in curr_preds]
             all_preds += curr_preds
         else:
             out = out.detach().cpu().numpy()
-            all_preds += [idx_to_label[pred] for pred in np.argmax(out, axis=1).tolist()]
+            all_preds += np.argmax(out, axis=1).tolist()
 
     return all_preds
 
@@ -131,9 +150,9 @@ def build_model(train_examples, dev_examples, pretrained_model, n_epochs=10, cur
     encoder = AutoModel.from_pretrained(pretrained_model)
     classifier = torch.nn.Linear(encoder.config.hidden_size, 1 if len(label_list) == 2 else len(label_list))
 
-    train_dataset = TransformersData(train_examples, label_to_idx, tokenizer, max_seq_length=max_seq_length, has_token_type_ids=has_token_type_ids)
+    train_dataset = TransformersData(train_examples, label_list, tokenizer, max_seq_length=max_seq_length, has_token_type_ids=has_token_type_ids)
     train_dataloader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    dev_dataset = TransformersData(dev_examples, label_to_idx, tokenizer, max_seq_length=max_seq_length, has_token_type_ids=has_token_type_ids)
+    dev_dataset = TransformersData(dev_examples, label_list, tokenizer, max_seq_length=max_seq_length, has_token_type_ids=has_token_type_ids)
     dev_dataloader = DataLoader(dataset=dev_dataset, batch_size=batch_size)
 
 
@@ -168,14 +187,14 @@ def build_model(train_examples, dev_examples, pretrained_model, n_epochs=10, cur
                 embeddings = encoder(input_ids, attention_mask=input_mask)[1]
 
             out = classifier(embeddings)
-            loss = criterion(out, label_ids)
+            loss = criterion(out.view(-1), label_ids.view(-1))
 
             loss.backward()
             global_step += 1
             nb_tr_steps += 1
 
-            torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(classifier.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), 1.0) # stabilizasyon. gradientlar kucuk norma.
+            torch.nn.utils.clip_grad_norm_(classifier.parameters(), 1.0) # stabilizasyon. gradientlar kucuk norma.
             optimizer.step()
             # scheduler.step()
             encoder.zero_grad()
@@ -240,7 +259,7 @@ if __name__ == '__main__':
 
     if predict:
         test_examples = get_examples(test_filename, with_label=False)
-        test_dataset = TransformersData(test_examples, label_to_idx, tokenizer, max_seq_length=max_seq_length, has_token_type_ids=has_token_type_ids, with_label=False)
+        test_dataset = TransformersData(test_examples, label_list, tokenizer, max_seq_length=max_seq_length, has_token_type_ids=has_token_type_ids, with_label=False)
         test_dataloader = DataLoader(dataset=test_dataset, batch_size=batch_size)
 
         all_preds = model_predict(encoder, classifier, test_dataloader)
@@ -254,7 +273,7 @@ if __name__ == '__main__':
 
     else:
         test_examples = get_examples(test_filename)
-        test_dataset = TransformersData(test_examples, label_to_idx, tokenizer, max_seq_length=max_seq_length, has_token_type_ids=has_token_type_ids)
+        test_dataset = TransformersData(test_examples, label_list, tokenizer, max_seq_length=max_seq_length, has_token_type_ids=has_token_type_ids)
         test_dataloader = DataLoader(dataset=test_dataset, batch_size=batch_size)
 
         result, test_loss = test_model(encoder, classifier, test_dataloader)
@@ -265,3 +284,12 @@ if __name__ == '__main__':
             print("  %s = %.6f" %(key, result[key]))
 
         print("TEST SCORE: %.6f" %result[dev_metric])
+        
+        with open(repo_path + "/performance_scores/perf_score_" + perf_scores_path, 'w') as fw:
+            for key in sorted(result.keys()):
+                fw.write("  %s = %.6f" %(key, result[key]))
+                fw.write('\n')
+
+            fw.write("TEST SCORE: %.6f" %result[dev_metric])
+            fw.write('\n')
+            
